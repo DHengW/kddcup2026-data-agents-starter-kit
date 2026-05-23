@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from queue import Empty
 from time import perf_counter
 from typing import Any
 
@@ -140,9 +141,20 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
         args=(task_id, config, queue),
     )
     process.start()
-    process.join(timeout_seconds)
 
-    if process.is_alive():
+    # BUGFIX (result-queue drain-order deadlock): DRAIN the result queue within the
+    # timeout budget BEFORE joining the child. A child that has put a large object on a
+    # multiprocessing.Queue does not terminate until the object is flushed to the
+    # underlying pipe by the feeder thread; if the parent joins first, the child can
+    # never exit, process.join(timeout) falsely times out, and a COMPLETED task is
+    # recorded as a timeout with a fallback empty/"0" answer. Because a real agent's
+    # run_result/trace far exceeds the OS pipe buffer (~64KB), this fires on essentially
+    # every non-trivial task. See the Python docs: multiprocessing "Programming
+    # guidelines -> Joining processes that use queues". Fix: get() drains within the
+    # budget; join() afterwards only for cleanup.
+    try:
+        result = queue.get(timeout=timeout_seconds)
+    except Empty:
         process.terminate()
         process.join(timeout=1.0)
         if process.is_alive():
@@ -150,7 +162,19 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
             process.join()
         return _failure_run_result_payload(task_id, f"Task timed out after {timeout_seconds} seconds.")
 
-    if queue.empty():
+    process.join(timeout=5.0)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=1.0)
+        if process.is_alive():
+            process.kill()
+            process.join()
+        return _failure_run_result_payload(
+            task_id,
+            "Task returned a result but did not exit cleanly.",
+        )
+
+    if result is None:
         exit_code = process.exitcode
         if exit_code not in (None, 0):
             return _failure_run_result_payload(
@@ -159,7 +183,6 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
             )
         return _failure_run_result_payload(task_id, "Task exited without returning a result.")
 
-    result = queue.get()
     if result.get("ok"):
         return dict(result["run_result"])
     return _failure_run_result_payload(task_id, f"Task failed with uncaught error: {result['error']}")
